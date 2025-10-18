@@ -4,69 +4,156 @@ import sys
 import os
 import cv2
 from hand_control import HandController
+try:
+    from openpyxl import Workbook, load_workbook
+    OPENPYXL = True
+except Exception:
+    OPENPYXL = False
 
-def draw_button(surface, rect, text, font, bg_color, text_color):
-    pygame.draw.rect(surface, bg_color, rect, border_radius=10)
-    label = font.render(text, True, text_color)
-    surface.blit(label, (rect.x + (rect.width - label.get_width()) // 2,
-                         rect.y + (rect.height - label.get_height()) // 2))
+from datetime import datetime
 
-# --- THIẾT LẬP CƠ BẢN ---
 pygame.init()
 
-# Kích thước màn hình
-SCREEN_WIDTH = 800
-SCREEN_HEIGHT = 600
+# --- KÍCH THƯỚC MÀN HÌNH ---
+SCREEN_WIDTH = 900
+SCREEN_HEIGHT = 800
 screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
 pygame.display.set_caption("Game Đập Chuột")
 
-fullscreen = False  # <-- Thêm dòng này
-
-# Bộ đếm thời gian
 clock = pygame.time.Clock()
 FPS = 120
 
-# ẨN CON TRỎ MẶC ĐỊNH
-pygame.mouse.set_visible(False)
+# --- DIFFICULTY / ADAPTIVE SETTINGS (tùy chỉnh để giảm độ khó) ---
+DIFFICULTY_PRESETS = {
+    "easy":   {"spawn_den": 240, "min_up": 2000, "max_up": 3500, "max_simultaneous": 2},
+    "normal": {"spawn_den": 120, "min_up": 1000, "max_up": 2500, "max_simultaneous": 3},
+    "hard":   {"spawn_den": 60,  "min_up": 700,  "max_up": 1800, "max_simultaneous": 4},
+}
 
-# Màu sắc
+# Mặc định cho người mới phục hồi: easy
+DIFFICULTY = "easy"
+_spawn_cfg = DIFFICULTY_PRESETS[DIFFICULTY]
+SPAWN_DENOM = _spawn_cfg["spawn_den"]         # spawn chance: 1 / SPAWN_DENOM (per frame)
+MOLE_UP_MIN_MS = _spawn_cfg["min_up"]
+MOLE_UP_MAX_MS = _spawn_cfg["max_up"]
+MAX_SIMULTANEOUS_MOLES = _spawn_cfg["max_simultaneous"]
+
+# --- MÀU ---
 WHITE = (255, 255, 255)
-RED = (255, 0, 0)
 BLACK = (0, 0, 0)
-GREEN = (0, 150, 0) 
+GREEN = (0, 150, 0)
+RED = (255, 0, 0)
 
-# Điểm số và thời gian
-score = 0
-game_time = 30  # Thời gian chơi (giây)
+# --- PHÔNG CHỮ ---
+font = pygame.font.SysFont("arial", 64)
+small_font = pygame.font.SysFont("arial", 32)
 
-# Phông chữ
-font = pygame.font.Font(None, 74)
-small_font = pygame.font.Font(None, 36)
-
-# --- TẢI HÌNH ẢNH ---
+# --- HÀM LOAD ẢNH ---
 def load_image(file_name, size=None):
     path = os.path.join('assets', file_name)
-    try:
-        image = pygame.image.load(path).convert_alpha()
-        if size:
-            return pygame.transform.scale(image, size)
-        return image
-    except pygame.error as e:
-        print(f"Không thể tải ảnh: {path}. Lỗi: {e}")
-        print(f"Hãy đảm bảo bạn đã tạo thư mục 'assets' và file '{file_name}'!")
-        placeholder_size = size if size else (100, 100)
-        placeholder = pygame.Surface(placeholder_size)
-        placeholder.fill(GREEN)
-        return placeholder
+    image = pygame.image.load(path).convert_alpha()
+    if size:
+        image = pygame.transform.scale(image, size)
+    return image
 
-# Tải các hình ảnh cần thiết cho Game Đập Chuột
 BACKGROUND_IMAGE = load_image('background.png', (SCREEN_WIDTH, SCREEN_HEIGHT))
 HOLE_IMAGE = load_image('hole.png', (150, 100))
 MOLE_IMAGE_UP = load_image('mole.png', (100, 100))
 MOLE_IMAGE_DOWN = load_image('hit_mole.png', (100, 100))
 HAMMER_IMAGE = load_image('hammer.png', (80, 80))
 
-# --- CLASS ĐỐI TƯỢNG CHUỘT ---
+ANGLES_XLSX = os.path.join(os.path.dirname(__file__), "game_angles.xlsx")
+ANGLES_SUMMARY_XLSX = os.path.join(os.path.dirname(__file__), "game_angles_summary.xlsx")
+
+def ensure_angles_xlsx():
+    if not OPENPYXL:
+        return
+    if not os.path.exists(ANGLES_XLSX):
+        wb = Workbook()
+        ws = wb.active
+        # THÊM cột clench_speed
+        ws.append(["timestamp","thumb","index","middle","ring","pinky","clench_speed"])
+        wb.save(ANGLES_XLSX)
+
+def save_angles_xlsx(angles, clench_speed=0.0):
+    if not OPENPYXL:
+        return
+    ensure_angles_xlsx()
+    wb = load_workbook(ANGLES_XLSX)
+    ws = wb.active
+    ts = datetime.now().isoformat()
+    ws.append([
+        ts,
+        angles.get("thumb",0),
+        angles.get("index",0),
+        angles.get("middle",0),
+        angles.get("ring",0),
+        angles.get("pinky",0),
+        clench_speed
+    ])
+    wb.save(ANGLES_XLSX)
+
+# --- summary (per round) functions ---
+def ensure_angles_summary_xlsx():
+    if not OPENPYXL:
+        return
+    if not os.path.exists(ANGLES_SUMMARY_XLSX):
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Summary"
+        header = [
+            "timestamp", "player", "round",
+            "frames_recorded"
+        ]
+        # add per-finger avg/max/min
+        fingers = ["thumb","index","middle","ring","pinky"]
+        for f in fingers:
+            header += [f + "_avg", f + "_max", f + "_min"]
+        # THÊM clench summary
+        header += ["clench_avg", "clench_max", "clench_min"]
+        ws.append(header)
+        wb.save(ANGLES_SUMMARY_XLSX)
+
+def save_angles_summary_xlsx(player, round_no, stats, clench_stats):
+    """
+    stats: dict finger -> {'count':int,'sum':float,'max':float,'min':float}
+    clench_stats: {'count':int,'sum':float,'max':float,'min':float}
+    """
+    if not OPENPYXL:
+        return
+    ensure_angles_summary_xlsx()
+    wb = load_workbook(ANGLES_SUMMARY_XLSX)
+    ws = wb.active
+    ts = datetime.now().isoformat()
+    fingers = ["thumb","index","middle","ring","pinky"]
+    frames = 0
+    row = [ts, player, round_no]
+    # frames recorded = count for any finger (they should be same)
+    for f in fingers:
+        frames = max(frames, stats.get(f, {}).get("count", 0))
+    row[3:3] = [frames]  # ensure frames at correct index
+
+    # append avg/max/min per finger
+    for f in fingers:
+        s = stats.get(f, {"count":0,"sum":0.0,"max":0.0,"min":0.0})
+        cnt = s.get("count", 0)
+        avg = (s.get("sum",0.0)/cnt) if cnt>0 else 0.0
+        mx = s.get("max", 0.0) if cnt>0 else 0.0
+        mn = s.get("min", 0.0) if cnt>0 else 0.0
+        row += [round(avg,1), round(mx,1), round(mn,1)]
+
+    # THÊM clench stats
+    c = clench_stats or {"count":0,"sum":0.0,"max":0.0,"min":0.0}
+    cnt = c.get("count",0)
+    cavg = (c.get("sum",0.0)/cnt) if cnt>0 else 0.0
+    cmx = c.get("max",0.0) if cnt>0 else 0.0
+    cmn = c.get("min",0.0) if cnt>0 else 0.0
+    row += [round(cavg,1), round(cmx,1), round(cmn,1)]
+
+    ws.append(row)
+    wb.save(ANGLES_SUMMARY_XLSX)
+
+# --- CLASS MOLE ---
 class Mole(pygame.sprite.Sprite):
     def __init__(self, x, y):
         super().__init__()
@@ -76,12 +163,12 @@ class Mole(pygame.sprite.Sprite):
 
         self.image = self.hole_image
         self.rect = self.image.get_rect(topleft=(x, y))
-        
         self.is_up = False
         self.hit = False
         self.time_up = 0
-        self.up_duration = random.randint(1000, 2500)
-        self.hit_display_time = 300 
+        # default up_duration will be set each time show() is called
+        self.up_duration = random.randint(MOLE_UP_MIN_MS, MOLE_UP_MAX_MS)
+        self.hit_display_time = 300
         self.time_hit = 0
 
     def show(self):
@@ -89,201 +176,296 @@ class Mole(pygame.sprite.Sprite):
             self.is_up = True
             self.hit = False
             self.time_up = pygame.time.get_ticks()
-            self.image = self.image_up 
-            self.rect = self.image.get_rect(center=(self.rect.centerx, self.rect.centery - 10))
+            # set up duration according to current difficulty config
+            self.up_duration = random.randint(MOLE_UP_MIN_MS, MOLE_UP_MAX_MS)
+            self.image = self.image_up
 
     def update(self):
-        current_time = pygame.time.get_ticks()
-        
+        now = pygame.time.get_ticks()
         if self.is_up:
             if self.hit:
-                if current_time - self.time_hit > self.hit_display_time:
+                if now - self.time_hit > self.hit_display_time:
                     self.is_up = False
                     self.image = self.hole_image
-                    self.rect = self.hole_image.get_rect(topleft=self.rect.topleft)
-            elif current_time - self.time_up > self.up_duration: 
+            elif now - self.time_up > self.up_duration:
                 self.is_up = False
                 self.image = self.hole_image
-                self.rect = self.hole_image.get_rect(topleft=self.rect.topleft)
 
     def was_hit(self):
+        global score, hit_count
         if self.is_up and not self.hit:
             self.hit = True
             self.image = self.image_down_hit
             self.time_hit = pygame.time.get_ticks()
-            global score
             score += 10
+            hit_count += 1
             return True
         return False
 
-# --- KHỞI TẠO GAME ---
-hole_width, hole_height = HOLE_IMAGE.get_size()
+# --- HÀM LƯU LỊCH SỬ ---
+def save_score_to_excel(player_name, score, hit_count, accuracy, filename="game_history.xlsx"):
+    if not os.path.exists(filename):
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "LichSu"
+        ws.append(["Thời gian", "Tên người chơi", "Điểm", "Số lần trúng", "Tỉ lệ phản ứng (%)"])
+        wb.save(filename)
 
-base_x = 220
-base_y = 250
-x_spacing = 170
-y_spacing = 120
+    wb = load_workbook(filename)
+    ws = wb.active
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ws.append([now, player_name, score, hit_count, round(accuracy, 1)])
+    wb.save(filename)
+    print(f"✅ Đã lưu kết quả của {player_name} vào {filename}")
 
-mole_center_positions = [
-    (base_x, base_y), (base_x + x_spacing, base_y), (base_x + 2 * x_spacing, base_y),
-    (base_x, base_y + y_spacing), (base_x + x_spacing, base_y + y_spacing), (base_x + 2 * x_spacing, base_y + y_spacing),
-    (base_x, base_y + 2 * y_spacing), (base_x + x_spacing, base_y + 2 * y_spacing), (base_x + 2 * x_spacing, base_y + 2 * y_spacing),
-]
+# --- HÀM VẼ NÚT ---
+def draw_button(surface, rect, text, font, bg_color, text_color):
+    pygame.draw.rect(surface, bg_color, rect, border_radius=10)
+    label = font.render(text, True, text_color)
+    surface.blit(label, (rect.x + (rect.width - label.get_width()) // 2,
+                         rect.y + (rect.height - label.get_height()) // 2))
 
-moles = []
-for cx, cy in mole_center_positions:
-    hole_x = cx - hole_width // 2
-    hole_y = cy - hole_height // 2
-    moles.append(Mole(hole_x, hole_y))
+# --- HÀM NHẬP TÊN + SỐ LẦN CHƠI ---
+def get_player_info():
+    # bật hiển thị chuột và text input (hỗ trợ IME)
+    pygame.mouse.set_visible(True)
+    pygame.key.start_text_input()
 
-# Biến điều khiển game
-running = True
-game_over = False
-start_time = pygame.time.get_ticks()
+    player_name = ""
+    num_games = ""
+    stage = "name"
+    input_active = True
 
-# Khởi tạo HandController
+    while input_active:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                pygame.key.stop_text_input()
+                pygame.quit(); sys.exit()
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_RETURN:
+                    if stage == "name" and player_name.strip():
+                        stage = "num"
+                    elif stage == "num" and num_games.strip().isdigit():
+                        input_active = False
+                elif event.key == pygame.K_BACKSPACE:
+                    if stage == "name":
+                        player_name = player_name[:-1]
+                    else:
+                        num_games = num_games[:-1]
+                elif event.key == pygame.K_ESCAPE:
+                    pygame.key.stop_text_input()
+                    pygame.quit(); sys.exit()
+                else:
+                    # dùng event.unicode để lấy ký tự nhập
+                    if stage == "name" and len(player_name) < 15:
+                        player_name += event.unicode
+                    elif stage == "num" and event.unicode.isdigit() and len(num_games) < 2:
+                        num_games += event.unicode
+            elif event.type == pygame.MOUSEBUTTONDOWN:
+                # xử lý click nút TIẾP TỤC
+                start_button = pygame.Rect(SCREEN_WIDTH // 2 - 100, 400, 200, 60)
+                if start_button.collidepoint(event.pos):
+                    if stage == "name" and player_name.strip():
+                        stage = "num"
+                    elif stage == "num" and num_games.strip().isdigit():
+                        input_active = False
+
+        screen.blit(BACKGROUND_IMAGE, (0, 0))
+        if stage == "name":
+            title = "NHAP TEN NGUOI CHOI:"
+            current = player_name
+        else:
+            title = "NHAP SO LAN CHOI:"
+            current = num_games
+
+        text = font.render(title, True, WHITE)
+        screen.blit(text, (SCREEN_WIDTH // 2 - text.get_width() // 2, 180))
+
+        name_text = small_font.render(current + "|", True, GREEN)
+        screen.blit(name_text, (SCREEN_WIDTH // 2 - name_text.get_width() // 2, 300))
+
+        start_button = pygame.Rect(SCREEN_WIDTH // 2 - 100, 400, 200, 60)
+        draw_button(screen, start_button, "TIEP TUC", small_font, GREEN, WHITE)
+
+        pygame.display.flip()
+        clock.tick(30)
+
+    pygame.key.stop_text_input()
+    pygame.mouse.set_visible(False)
+    return player_name, int(num_games)
+
+# --- KHỞI TẠO ---
+base_x, base_y = 220, 250
+x_spacing, y_spacing = 170, 120
+mole_positions = [(base_x + i * x_spacing, base_y + j * y_spacing) for j in range(3) for i in range(3)]
+moles = [Mole(x, y) for x, y in mole_positions]
+
 hand_controller = HandController()
-cam_on = True
 hand_controller.start_detection()
 
-# --- VÒNG LẶP GAME CHÍNH ---
-while running:
-    for event in pygame.event.get():
-        if event.type == pygame.QUIT:
-            running = False
-        if event.type == pygame.KEYDOWN:
-            if event.key == pygame.K_c:
-                cam_on = not cam_on
-                if cam_on:
-                    hand_controller.start_detection()
-                else:
+# --- VÒNG LẶP TOÀN GAME ---
+while True:
+    player_name, total_rounds = get_player_info()
+    round_count = 0
+
+    while round_count < total_rounds:
+        score = 0
+        hit_count = 0
+        total_moles_shown = 0
+        game_time = 30
+        game_over = False
+        start_time = pygame.time.get_ticks()
+
+        # --- INIT ANGLE STATS FOR THIS ROUND ---
+        fingers = ["thumb","index","middle","ring","pinky"]
+        angle_stats = {f: {"count":0, "sum":0.0, "max":-9999.0, "min":9999.0} for f in fingers}
+        # --- MỚI: clench stats ---
+        clench_stats = {"count":0, "sum":0.0, "max":-9999.0, "min":9999.0}
+
+        running = True
+        while running:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
                     hand_controller.stop_detection()
-            if event.key == pygame.K_F11:
-                fullscreen = not fullscreen
-                if fullscreen:
-                    screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.FULLSCREEN)
-                else:
-                    screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
-        if event.type == pygame.MOUSEBUTTONDOWN and game_over:
-            mouse_pos = pygame.mouse.get_pos()
-            if play_again_rect.collidepoint(mouse_pos):
-                # Reset game state
-                score = 0
-                game_over = False
-                start_time = pygame.time.get_ticks()
+                    pygame.quit(); sys.exit()
+                if event.type == pygame.MOUSEBUTTONDOWN and game_over:
+                    if play_again_rect.collidepoint(pygame.mouse.get_pos()):
+                        running = False  # chuyển sang lượt chơi tiếp theo
+
+                # --- Thay đổi độ khó bằng phím 1/2/3 (tùy ý) ---
+                if event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_1:
+                        DIFFICULTY = "easy"
+                    elif event.key == pygame.K_2:
+                        DIFFICULTY = "normal"
+                    elif event.key == pygame.K_3:
+                        DIFFICULTY = "hard"
+                    # cập nhật cấu hình sau khi đổi
+                    _spawn_cfg = DIFFICULTY_PRESETS[DIFFICULTY]
+                    SPAWN_DENOM = _spawn_cfg["spawn_den"]
+                    MOLE_UP_MIN_MS = _spawn_cfg["min_up"]
+                    MOLE_UP_MAX_MS = _spawn_cfg["max_up"]
+                    MAX_SIMULTANEOUS_MOLES = _spawn_cfg["max_simultaneous"]
+
+            hand_position, gesture, cam_frame = hand_controller.get_hand_position()
+
+            # --- update angle stats each frame ---
+            angles = hand_controller.last_angles or {}
+            # clench speed từ hand_controller
+            clench_speed = getattr(hand_controller, "last_clench_speed", 0.0)
+
+            if angles:
+                for f in fingers:
+                    val = float(angles.get(f, 0.0))
+                    s = angle_stats[f]
+                    s["count"] += 1
+                    s["sum"] += val
+                    if val > s["max"]:
+                        s["max"] = val
+                    if val < s["min"]:
+                        s["min"] = val
+
+            # cập nhật clench_stats mỗi frame (nếu có reading)
+            if clench_speed is not None:
+                c = clench_stats
+                c["count"] += 1
+                c["sum"] += float(clench_speed)
+                if clench_speed > c["max"]:
+                    c["max"] = clench_speed
+                if clench_speed < c["min"]:
+                    c["min"] = clench_speed
+
+            if not game_over:
+                elapsed = (pygame.time.get_ticks() - start_time) // 1000
+                time_left = game_time - elapsed
+                if time_left <= 0:
+                    game_over = True
+                    acc = (hit_count / total_moles_shown * 100) if total_moles_shown > 0 else 0
+                    save_score_to_excel(player_name, score, hit_count, acc)
+
                 for mole in moles:
-                    mole.is_up = False
-                    mole.hit = False
-                    mole.image = mole.hole_image
+                    mole.update()
 
-    # Cập nhật vị trí tay và kiểm tra động tác gõ
-    if cam_on:
-        hand_position, gesture, cam_frame = hand_controller.get_hand_position()
+                # giới hạn số moles cùng lúc và dùng SPAWN_DENOM để điều khiển tần suất
+                up_count = sum(1 for m in moles if m.is_up)
+                if up_count < MAX_SIMULTANEOUS_MOLES and random.randint(1, SPAWN_DENOM) == 1:
+                    available = [m for m in moles if not m.is_up]
+                    if available:
+                        random.choice(available).show()
+                        total_moles_shown += 1
 
-        if not game_over:
-            elapsed_time = (pygame.time.get_ticks() - start_time) // 1000
-            time_left = game_time - elapsed_time
-            
-            if time_left <= 0:
-                game_over = True
-            
+                if hand_position and gesture:
+                    for mole in moles:
+                        if mole.rect.collidepoint(hand_position):
+                            mole.was_hit()
+
+            screen.blit(BACKGROUND_IMAGE, (0, 0))
             for mole in moles:
-                mole.update()
-            
-            # Logic cho chuột xuất hiện ngẫu nhiên
-            if random.randint(1, 60) == 1: 
-                available_moles = [m for m in moles if not m.is_up]
-                if available_moles:
-                    random_mole = random.choice(available_moles)
-                    random_mole.show()
-
-            # Kiểm tra nếu tay ở vị trí nào đó và có động tác gõ để đánh chuột
-            if hand_position and gesture:
-                for mole in moles:
-                    if mole.rect.collidepoint(hand_position):
-                        mole.was_hit()
-    else:
-        hand_position, gesture, cam_frame = None, False, None
-        if not game_over:
-            elapsed_time = (pygame.time.get_ticks() - start_time) // 1000
-            time_left = game_time - elapsed_time
-            
-            if time_left <= 0:
-                game_over = True
-            
+                screen.blit(mole.hole_image, mole.rect)
             for mole in moles:
-                mole.update()
-            
-            # Logic cho chuột xuất hiện ngẫu nhiên
-            if random.randint(1, 60) == 1: 
-                available_moles = [m for m in moles if not m.is_up]
-                if available_moles:
-                    random_mole = random.choice(available_moles)
-                    random_mole.show()
+                if mole.is_up:
+                    screen.blit(mole.image, mole.rect)
 
-            # Kiểm tra nếu tay ở vị trí nào đó và có động tác gõ để đánh chuột
-            if hand_position and gesture:
-                for mole in moles:
-                    if mole.rect.collidepoint(hand_position):
-                        mole.was_hit()
+            score_text = small_font.render(f"Score: {score}", True, BLACK)
+            time_text = small_font.render(f"Time: {max(0, game_time - (pygame.time.get_ticks() - start_time)//1000)}s", True, BLACK)
+            screen.blit(score_text, (10, 10))
+            screen.blit(time_text, (SCREEN_WIDTH - time_text.get_width() - 10, 10))
 
-    # --- Vẽ lên màn hình ---
-    screen.blit(BACKGROUND_IMAGE, (0, 0))
-    
-    for mole in moles:
-        screen.blit(mole.hole_image, mole.rect)
+            if hand_position:
+                screen.blit(HAMMER_IMAGE, (hand_position[0]-30, hand_position[1]-30))
 
-    for mole in moles:
-        if mole.is_up:
-             screen.blit(mole.image, mole.rect)
-    
-    score_text = small_font.render(f"Score: {score}", True, BLACK)
-    screen.blit(score_text, (10, 10))
-    
-    time_text = small_font.render(f"Time: {max(0, time_left)}s", True, BLACK)
-    screen.blit(time_text, (SCREEN_WIDTH - time_text.get_width() - 10, 10))
-    
-    # VẼ HÌNH ẢNH CÁI BÚA THEO TỌA ĐỘ TAY
-    if hand_position:
-        hammer_offset_x = 20
-        hammer_offset_y = 20
-        screen.blit(HAMMER_IMAGE, (hand_position[0] - hammer_offset_x, hand_position[1] - hammer_offset_y))
+            if game_over:
+                # save per-round summary
+                save_angles_summary_xlsx(player_name, round_count + 1, angle_stats, clench_stats)
+                # also optionally save last frame angles + clench speed as row
+                if angles:
+                    save_angles_xlsx(angles, clench_speed)
 
-    if game_over:
-        overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
-        overlay.fill((0, 0, 0, 180))
-        screen.blit(overlay, (0, 0))
-        
-        game_over_text = font.render("GAME OVER", True, RED)
-        final_score_text = small_font.render(f"Final Score: {score}", True, WHITE)
-        
-        screen.blit(game_over_text, (SCREEN_WIDTH // 2 - game_over_text.get_width() // 2, SCREEN_HEIGHT // 3))
-        screen.blit(final_score_text, (SCREEN_WIDTH // 2 - final_score_text.get_width() // 2, SCREEN_HEIGHT // 3 + 100))
-        
-        # Vẽ nút chơi lại
-        button_w, button_h = 200, 60
-        button_x = SCREEN_WIDTH // 2 - button_w // 2
-        button_y = SCREEN_HEIGHT // 3 + 200
-        play_again_rect = pygame.Rect(button_x, button_y, button_w, button_h)
-        draw_button(screen, play_again_rect, "CHOI LAI", small_font, GREEN, WHITE)
-    
-    # Hiển thị camera ở góc phải dưới
-    if cam_frame is not None:
-        cam_h, cam_w = 150, 180  # Kích thước khung camera nhỏ
-        cam_frame = cv2.resize(cam_frame, (cam_w, cam_h))
-        cam_frame = cv2.cvtColor(cam_frame, cv2.COLOR_BGR2RGB)
-        cam_surface = pygame.surfarray.make_surface(cam_frame.swapaxes(0, 1))
-        screen.blit(cam_surface, (SCREEN_WIDTH - cam_w - 10, SCREEN_HEIGHT - cam_h - 10))
+                pygame.mouse.set_visible(True)
+                overlay = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
+                overlay.fill((0, 0, 0, 180))
+                screen.blit(overlay, (0, 0))
 
-    if game_over:
-        pygame.mouse.set_visible(True)
-    else:
-        pygame.mouse.set_visible(False)
+                acc = (hit_count / total_moles_shown * 100) if total_moles_shown > 0 else 0
+                texts = [
+                    font.render("GAME OVER", True, RED),
+                    small_font.render(f"Ten: {player_name}", True, WHITE),
+                    small_font.render(f"Diem: {score}", True, WHITE),
+                    small_font.render(f"So lan nam tay: {hit_count}", True, WHITE),
+                    small_font.render(f"Ti le phan ung: {acc:.1f}%", True, WHITE)
+                ]
+                for i, t in enumerate(texts):
+                    screen.blit(t, (SCREEN_WIDTH//2 - t.get_width()//2, 200 + i*60))
 
+                play_again_rect = pygame.Rect(SCREEN_WIDTH//2 - 100, 600, 200, 60)
+                draw_button(screen, play_again_rect, "LUOT TIEP", small_font, GREEN, WHITE)
+
+            if cam_frame is not None:
+                cam_h, cam_w = 150, 180
+                cam_frame = cv2.resize(cam_frame, (cam_w, cam_h))
+                cam_frame = cv2.cvtColor(cam_frame, cv2.COLOR_BGR2RGB)
+                cam_surface = pygame.surfarray.make_surface(cam_frame.swapaxes(0, 1))
+                screen.blit(cam_surface, (SCREEN_WIDTH - cam_w - 10, SCREEN_HEIGHT - cam_h - 10))
+
+            pygame.display.flip()
+            clock.tick(FPS)
+
+        round_count += 1
+
+    # --- Hết số lần chơi ---
+    screen.fill(BLACK)
+    msg = font.render("DA HET LUOT!", True, RED)
+    msg2 = small_font.render("An phim bat ky ", True, WHITE)
+    screen.blit(msg, (SCREEN_WIDTH//2 - msg.get_width()//2, 300))
+    screen.blit(msg2, (SCREEN_WIDTH//2 - msg2.get_width()//2, 400))
     pygame.display.flip()
-    clock.tick(FPS)
 
-# Thoát Pygame
-hand_controller.stop_detection()
-pygame.quit()
-sys.exit()
+    waiting = True
+    while waiting:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                hand_controller.stop_detection()
+                pygame.quit(); sys.exit()
+            elif event.type == pygame.KEYDOWN:
+                waiting = False
+
