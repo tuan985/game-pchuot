@@ -1,25 +1,21 @@
-import time
-import math
 import cv2
 import mediapipe as mp
-
+import numpy as np
+import time
+import math
 
 class HandController:
     """
-    Quản lý camera + MediaPipe hands.
-
-    Methods:
-      - start_detection(src=0, width=640, height=480): mở camera
-      - stop_detection(): giải phóng camera
-      - get_hand_position(): trả về (hand_pos, gesture, frame)
-         hand_pos: (x,y) pixel của WRIST hoặc None
-         gesture: True khi phát hiện nắm tay (fist) theo vị trí hoặc góc, có cooldown
-         frame: frame BGR (đã flip) có vẽ landmarks (dùng để hiển thị)
-      - last_angles: dict lưu góc từng ngón (deg)
-      - last_clench_speed: tốc độ thay đổi mean-angle (deg/s)
+    Lớp HandController ĐÃ NÂNG CẤP để phục hồi chức năng.
+    
+    Tích hợp logic hiệu chỉnh, phát hiện ngoại lai, và đo góc mượt mà
+    CHO CẢ 5 NGÓN TAY.
+    
+    (MỚI) Tự động tính toán và trả về độ dài + tỷ lệ các khớp.
     """
-
+    
     def __init__(self, max_hands=1, min_detection_confidence=0.6, min_tracking_confidence=0.5):
+        # --- MediaPipe Init ---
         self.mp_hands = mp.solutions.hands
         self.mp_draw = mp.solutions.drawing_utils
         self.hands = self.mp_hands.Hands(
@@ -29,184 +25,253 @@ class HandController:
             min_tracking_confidence=min_tracking_confidence,
         )
 
+        # --- Camera Init ---
         self.cap = None
-        self.last_angles = {}            # {'thumb','index','middle','ring','pinky'} in degrees
-        self.prev_mean_angle = None      # previous frame mean of finger angles
-        self.prev_mean_time = None
-        self.last_clench_speed = 0.0     # deg / s
-        self.gesture_cooldown = 0.3      # seconds between gestures
-        self.last_gesture_time = 0.0
 
+        # --- Trạng thái (State) của Bộ xử lý ---
+        self.static_profile = {}             
+        self.angle_extended_dict = {}    
+        self.smoothed_angle_dict = {}    
+        self.is_calibrated = False           
+
+        # --- Cài đặt (Settings) ---
+        self.EMA_ALPHA = 0.3            
+        # Tăng ngưỡng để giảm nhiễu khi nắm tay
+        self.OUTLIER_THRESHOLD = 0.35 
+        
+        # --- Định nghĩa các Điểm mốc (Landmark Definitions) ---
+        self.FINGERS_LIST = ["thumb", "index", "middle", "ring", "pinky"]
+        
+        self.REFERENCE_BONES = (
+            self.mp_hands.HandLandmark.INDEX_FINGER_MCP, 
+            self.mp_hands.HandLandmark.PINKY_MCP
+        ) 
+        
+        self.ANGLES_TO_MEASURE_DEF = {
+            'index': (self.mp_hands.HandLandmark.WRIST, self.mp_hands.HandLandmark.INDEX_FINGER_MCP, self.mp_hands.HandLandmark.INDEX_FINGER_PIP),
+            'middle': (self.mp_hands.HandLandmark.WRIST, self.mp_hands.HandLandmark.MIDDLE_FINGER_MCP, self.mp_hands.HandLandmark.MIDDLE_FINGER_PIP),
+            'ring': (self.mp_hands.HandLandmark.WRIST, self.mp_hands.HandLandmark.RING_FINGER_MCP, self.mp_hands.HandLandmark.RING_FINGER_PIP),
+            'pinky': (self.mp_hands.HandLandmark.WRIST, self.mp_hands.HandLandmark.PINKY_MCP, self.mp_hands.HandLandmark.PINKY_PIP),
+            'thumb': (self.mp_hands.HandLandmark.THUMB_MCP, self.mp_hands.HandLandmark.THUMB_IP, self.mp_hands.HandLandmark.THUMB_TIP),
+        }
+        
+        # (MỚI) Đổi tên để dễ truy cập
+        self.BONE_INDICES_TO_MONITOR = {
+            'index_mcp': (self.mp_hands.HandLandmark.INDEX_FINGER_MCP, self.mp_hands.HandLandmark.INDEX_FINGER_PIP),
+            'index_pip': (self.mp_hands.HandLandmark.INDEX_FINGER_PIP, self.mp_hands.HandLandmark.INDEX_FINGER_DIP),
+            'middle_mcp': (self.mp_hands.HandLandmark.MIDDLE_FINGER_MCP, self.mp_hands.HandLandmark.MIDDLE_FINGER_PIP),
+            'middle_pip': (self.mp_hands.HandLandmark.MIDDLE_FINGER_PIP, self.mp_hands.HandLandmark.MIDDLE_FINGER_DIP),
+            'ring_mcp': (self.mp_hands.HandLandmark.RING_FINGER_MCP, self.mp_hands.HandLandmark.RING_FINGER_PIP),
+            'pinky_mcp': (self.mp_hands.HandLandmark.PINKY_MCP, self.mp_hands.HandLandmark.PINKY_PIP),
+        }
+        # (MỚI) Tạo danh sách tên xương để lặp
+        self.BONE_NAMES_LIST = list(self.BONE_INDICES_TO_MONITOR.keys())
+
+    # === CÁC HÀM QUẢN LÝ CAMERA (Giữ nguyên) ===
     def start_detection(self, src=0, width=640, height=480):
-        """Open camera (index or path). Safe to call multiple times."""
-        if self.cap is not None and self.cap.isOpened():
-            return
+        if self.cap is not None and self.cap.isOpened(): return True
         self.cap = cv2.VideoCapture(src)
+        if not self.cap.isOpened():
+            print(f"Lỗi: không thể mở camera tại nguồn {src}"); self.cap = None; return False
         try:
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        except Exception:
-            pass
+            print(f"Camera đã mở (nguồn {src})"); return True
+        except Exception as e:
+            print(f"Lỗi khi cài đặt camera: {e}"); return False
 
     def stop_detection(self):
-        """Release camera and close OpenCV windows."""
         try:
             if self.cap is not None:
-                self.cap.release()
-                self.cap = None
+                self.cap.release(); self.cap = None; print("Camera đã đóng")
         finally:
-            cv2.destroyAllWindows()
+            cv2.destroyAllWindows(); self.hands.close()
 
-    def _angle_between_vectors(self, v1, v2):
-        """Return angle in degrees between 2D vectors v1 and v2."""
-        dot = v1[0] * v2[0] + v1[1] * v2[1]
-        mag1 = math.hypot(v1[0], v1[1])
-        mag2 = math.hypot(v2[0], v2[1])
-        if mag1 == 0 or mag2 == 0:
-            return 0.0
-        cosang = max(-1.0, min(1.0, dot / (mag1 * mag2)))
-        return math.degrees(math.acos(cosang))
+    # === CÁC HÀM HỖ TRỢ TÍNH TOÁN (ĐÃ NÂNG CẤP) ===
+    def _hpr_distance(self, p1, p2):
+        return np.linalg.norm(p1 - p2)
 
-    def compute_finger_angles(self, hand_landmarks, image=None, draw=True):
+    def _hpr_angle(self, p1, p2, p3):
+        v1 = p1 - p2; v2 = p3 - p2
+        dot_product = np.dot(v1, v2)
+        norm_product = np.linalg.norm(v1) * np.linalg.norm(v2)
+        if norm_product == 0: return 180.0
+        cosine_angle = np.clip(dot_product / norm_product, -1.0, 1.0)
+        return np.degrees(np.arccos(cosine_angle))
+
+    def _hpr_landmarks_to_array(self, landmark_list):
+        return np.array([[lm.x, lm.y, lm.z] for lm in landmark_list])
+
+    def _hpr_get_current_biomechanics(self, landmarks):
         """
-        Compute angles (degrees) for each finger and update last_angles.
-        - thumb: angle at THUMB_IP between vectors (THUMB_MCP->THUMB_IP) and (THUMB_TIP->THUMB_IP)
-        - index/middle/ring/pinky: angle at PIP between vectors (MCP->PIP) and (DIP->PIP)
-        Also compute mean of index..pinky and update last_clench_speed (deg/s).
-        If image provided and draw=True, angle texts are drawn on image.
+        (MỚI) Hàm này tính toán độ dài, tỷ lệ VÀ phát hiện ngoại lai.
+        Trả về: (dict_lengths, dict_ratios, bool_is_outlier)
         """
-        lm = hand_landmarks.landmark
-        h, w = (None, None)
-        if image is not None:
-            h, w = image.shape[:2]
-
-        def to_px(pt):
-            return (int(pt.x * w), int(pt.y * h)) if (w and h) else (pt.x, pt.y)
-
-        angles = {}
-
-        # Thumb: use MCP, IP, TIP -> angle at IP
+        current_lengths = {}
+        current_ratios = {}
+        is_outlier = False
+        
         try:
-            thumb_mcp = to_px(lm[self.mp_hands.HandLandmark.THUMB_MCP])
-            thumb_ip = to_px(lm[self.mp_hands.HandLandmark.THUMB_IP])
-            thumb_tip = to_px(lm[self.mp_hands.HandLandmark.THUMB_TIP])
-            v1 = (thumb_mcp[0] - thumb_ip[0], thumb_mcp[1] - thumb_ip[1])
-            v2 = (thumb_tip[0] - thumb_ip[0], thumb_tip[1] - thumb_ip[1])
-            angles['thumb'] = self._angle_between_vectors(v1, v2)
-            if draw and image is not None:
-                cv2.putText(image, f"{int(angles['thumb'])}", (thumb_ip[0] - 12, thumb_ip[1] - 8),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            # 1. Lấy "thước đo" của khung hình hiện tại
+            p_ref_1 = landmarks[self.REFERENCE_BONES[0]]
+            p_ref_2 = landmarks[self.REFERENCE_BONES[1]]
+            L_ref_current = self._hpr_distance(p_ref_1, p_ref_2)
+            
+            if L_ref_current < 1e-6: # Gần như bằng 0
+                is_outlier = True
+                # Trả về dữ liệu rỗng nếu không có thước đo
+                for name in self.BONE_NAMES_LIST:
+                    current_lengths[name] = 0.0
+                    current_ratios[name] = 0.0
+                return current_lengths, current_ratios, is_outlier
+
+            # 2. Tính toán và kiểm tra từng xương
+            for name in self.BONE_NAMES_LIST:
+                p1_idx, p2_idx = self.BONE_INDICES_TO_MONITOR[name]
+                length = self._hpr_distance(landmarks[p1_idx], landmarks[p2_idx])
+                ratio = length / L_ref_current
+                
+                current_lengths[name] = length
+                current_ratios[name] = ratio
+                
+                # 3. So sánh độ sai lệch (nếu đã hiệu chỉnh)
+                if self.is_calibrated:
+                    static_ratio = self.static_profile.get(name, ratio) # Lấy tỷ lệ tĩnh
+                    deviation = abs(ratio - static_ratio) / static_ratio
+                    if deviation > self.OUTLIER_THRESHOLD:
+                        is_outlier = True # Chỉ cần 1 xương sai là báo ngoại lai
+            
+            return current_lengths, current_ratios, is_outlier
+        
         except Exception:
-            angles['thumb'] = 0.0
+            # Trả về rỗng nếu có lỗi
+            for name in self.BONE_NAMES_LIST:
+                current_lengths[name] = 0.0
+                current_ratios[name] = 0.0
+            return current_lengths, current_ratios, True 
 
-        # Other fingers: angle at PIP using MCP, PIP, DIP
-        finger_defs = [
-            ('index', self.mp_hands.HandLandmark.INDEX_FINGER_MCP, self.mp_hands.HandLandmark.INDEX_FINGER_PIP, self.mp_hands.HandLandmark.INDEX_FINGER_DIP),
-            ('middle', self.mp_hands.HandLandmark.MIDDLE_FINGER_MCP, self.mp_hands.HandLandmark.MIDDLE_FINGER_PIP, self.mp_hands.HandLandmark.MIDDLE_FINGER_DIP),
-            ('ring', self.mp_hands.HandLandmark.RING_FINGER_MCP, self.mp_hands.HandLandmark.RING_FINGER_PIP, self.mp_hands.HandLandmark.RING_FINGER_DIP),
-            ('pinky', self.mp_hands.HandLandmark.PINKY_MCP, self.mp_hands.HandLandmark.PINKY_PIP, self.mp_hands.HandLandmark.PINKY_DIP),
-        ]
+    # === CÁC HÀM CHỨC NĂNG CHÍNH (Đã nâng cấp) ===
 
-        for name, mcp_i, pip_i, dip_i in finger_defs:
-            try:
-                mcp = to_px(lm[mcp_i])
-                pip = to_px(lm[pip_i])
-                dip = to_px(lm[dip_i])
-                v1 = (mcp[0] - pip[0], mcp[1] - pip[1])
-                v2 = (dip[0] - pip[0], dip[1] - pip[1])
-                ang = self._angle_between_vectors(v1, v2)
-                angles[name] = ang
-                if draw and image is not None:
-                    cv2.putText(image, f"{int(ang)}", (pip[0] - 12, pip[1] - 8),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-            except Exception:
-                angles[name] = 0.0
-
-        # update last_angles
-        self.last_angles = angles
-
-        # compute clench speed: change of mean(index..pinky) / dt
-        now = time.time()
-        mean_f = 0.0
-        cnt = 0
-        for k in ('index', 'middle', 'ring', 'pinky'):
-            mean_f += angles.get(k, 0.0)
-            cnt += 1
-        mean_f = (mean_f / cnt) if cnt else 0.0
-
-        if self.prev_mean_angle is not None and self.prev_mean_time is not None:
-            dt = now - self.prev_mean_time
-            if dt > 0:
-                speed = (mean_f - self.prev_mean_angle) / dt
-            else:
-                speed = 0.0
-        else:
-            speed = 0.0
-
-        self.last_clench_speed = speed
-        self.prev_mean_angle = mean_f
-        self.prev_mean_time = now
-
-        return angles
-
-    def get_hand_position(self):
+    def calibrate(self, hand_landmarks_result):
         """
-        Read camera frame, detect hand, compute wrist position, angles and gesture.
-        Returns (hand_pos, gesture, frame).
+        Chạy hiệu chỉnh. Yêu cầu bệnh nhân XÒE THẲNG TAY.
+        Lưu hồ sơ tĩnh VÀ góc duỗi thẳng cho CẢ 5 NGÓN.
         """
-        if self.cap is None:
-            return None, False, None
+        print("Đang hiệu chỉnh... Vui lòng xòe thẳng tay!")
+        landmarks = self._hpr_landmarks_to_array(hand_landmarks_result.landmark)
+        
+        try:
+            # 1. THIẾT LẬP THƯỚC ĐO CHUẨN (L_ref)
+            p_ref_1 = landmarks[self.REFERENCE_BONES[0]]
+            p_ref_2 = landmarks[self.REFERENCE_BONES[1]]
+            L_ref = self._hpr_distance(p_ref_1, p_ref_2)
+            
+            if L_ref < 1e-6:
+                print("Lỗi hiệu chỉnh: Không thể lấy thước đo chuẩn. Thử lại.")
+                return False
+
+            # 2. THU THẬP THÔNG SỐ TĨNH (TỶ LỆ XƯƠNG)
+            self.static_profile = {} 
+            for name in self.BONE_NAMES_LIST:
+                p1_idx, p2_idx = self.BONE_INDICES_TO_MONITOR[name]
+                length = self._hpr_distance(landmarks[p1_idx], landmarks[p2_idx])
+                self.static_profile[name] = length / L_ref # Lưu tỷ lệ
+
+            # 3. THIẾT LẬP MỐC 0% (GÓC DUỖI) CHO CẢ 5 NGÓN
+            self.angle_extended_dict = {}
+            self.smoothed_angle_dict = {}
+            
+            for name, (p1_idx, p2_idx, p3_idx) in self.ANGLES_TO_MEASURE_DEF.items():
+                angle = self._hpr_angle(landmarks[p1_idx], landmarks[p2_idx], landmarks[p3_idx])
+                self.angle_extended_dict[name] = angle
+                self.smoothed_angle_dict[name] = angle 
+
+            self.is_calibrated = True
+            print(f"...Hiệu chỉnh thành công! Hồ sơ tĩnh đã lưu.")
+            return True
+        
+        except Exception as e:
+            print(f"Lỗi hiệu chỉnh: {e}")
+            self.is_calibrated = False
+            return False
+
+    def get_frame_data(self):
+        """
+        Hàm chính. Đọc frame, xử lý, và trả về dữ liệu phục hồi chức năng.
+        
+        Returns: (frame, rehab_data, hand_landmarks_object)
+            - frame: ảnh BGR đã vẽ
+            - rehab_data: dict {
+                'angles': dict, 
+                'bone_lengths': dict, 
+                'bone_ratios': dict,
+                'is_outlier': bool, 
+                'is_calibrated': bool,
+                'hand_pos': (x,y)
+            }
+            - hand_landmarks_object: Đối tượng landmarks thô (dùng để hiệu chỉnh)
+        """
+        if self.cap is None or not self.cap.isOpened():
+            return None, self._get_default_rehab_data(), None
 
         success, frame = self.cap.read()
         if not success or frame is None:
-            return None, False, None
+            return None, self._get_default_rehab_data(), None
 
-        frame = cv2.flip(frame, 1)  # mirror
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = self.hands.process(rgb)
+        frame = cv2.flip(frame, 1) # Lật ngang
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = self.hands.process(rgb_frame)
 
-        hand_pos = None
-        gesture = False
+        rehab_data = self._get_default_rehab_data()
+        hand_landmarks_object = None
 
         if results.multi_hand_landmarks:
-            # use first detected hand
-            hand_landmarks = results.multi_hand_landmarks[0]
-            self.mp_draw.draw_landmarks(frame, hand_landmarks, self.mp_hands.HAND_CONNECTIONS)
-
-            # wrist position in pixels
+            hand_landmarks_object = results.multi_hand_landmarks[0]
+            self.mp_draw.draw_landmarks(frame, hand_landmarks_object, self.mp_hands.HAND_CONNECTIONS)
+            
             try:
-                wpt = hand_landmarks.landmark[self.mp_hands.HandLandmark.WRIST]
-                hand_pos = (int(wpt.x * frame.shape[1]), int(wpt.y * frame.shape[0]))
+                wpt = hand_landmarks_object.landmark[self.mp_hands.HandLandmark.WRIST]
+                rehab_data['hand_pos'] = (int(wpt.x * frame.shape[1]), int(wpt.y * frame.shape[0]))
             except Exception:
-                hand_pos = None
+                pass 
+            
+            landmarks_arr = self._hpr_landmarks_to_array(hand_landmarks_object.landmark)
 
-            # angles (and draw)
-            self.compute_finger_angles(hand_landmarks, image=frame, draw=True)
+            # (MỚI) Lấy thông tin cơ sinh học (dài, tỷ lệ, ngoại lai)
+            lengths, ratios, is_outlier = self._hpr_get_current_biomechanics(landmarks_arr)
+            rehab_data['bone_lengths'] = lengths
+            rehab_data['bone_ratios'] = ratios
+            rehab_data['is_outlier'] = is_outlier
 
-            # detect fist by comparing tip.y and pip.y for 4 fingers
-            folded = 0
-            try:
-                tips = [self.mp_hands.HandLandmark.INDEX_FINGER_TIP,
-                        self.mp_hands.HandLandmark.MIDDLE_FINGER_TIP,
-                        self.mp_hands.HandLandmark.RING_FINGER_TIP,
-                        self.mp_hands.HandLandmark.PINKY_TIP]
-                pips = [self.mp_hands.HandLandmark.INDEX_FINGER_PIP,
-                        self.mp_hands.HandLandmark.MIDDLE_FINGER_PIP,
-                        self.mp_hands.HandLandmark.RING_FINGER_PIP,
-                        self.mp_hands.HandLandmark.PINKY_PIP]
-                for tip, pip in zip(tips, pips):
-                    if hand_landmarks.landmark[tip].y > hand_landmarks.landmark[pip].y:
-                        folded += 1
-            except Exception:
-                folded = 0
-
-            # optionally also use angle threshold
-            ang_fold_count = sum(1 for k in ('index', 'middle', 'ring', 'pinky') if self.last_angles.get(k, 0.0) > 60)
-
-            now = time.time()
-            folded_ok = (folded >= 3) or (ang_fold_count >= 3)
-            if folded_ok and (now - self.last_gesture_time) > self.gesture_cooldown:
-                gesture = True
-                self.last_gesture_time = now
-
-        return hand_pos, gesture, frame
+            # Tính toán góc (chỉ khi đã hiệu chỉnh)
+            if self.is_calibrated:
+                flexion_angles = {}
+                for name in self.FINGERS_LIST:
+                    (p1_idx, p2_idx, p3_idx) = self.ANGLES_TO_MEASURE_DEF[name]
+                    
+                    if not is_outlier:
+                        raw_angle = self._hpr_angle(landmarks_arr[p1_idx], landmarks_arr[p2_idx], landmarks_arr[p3_idx])
+                        self.smoothed_angle_dict[name] = (self.EMA_ALPHA * raw_angle) + \
+                                                         ((1.0 - self.EMA_ALPHA) * self.smoothed_angle_dict[name])
+                    
+                    flex_angle = self.angle_extended_dict[name] - self.smoothed_angle_dict[name]
+                    flexion_angles[name] = max(0, flex_angle) 
+                
+                rehab_data['angles'] = flexion_angles
+            
+        return frame, rehab_data, hand_landmarks_object
+    
+    def _get_default_rehab_data(self):
+        """Trả về dữ liệu rỗng khi không phát hiện tay hoặc chưa hiệu chỉnh"""
+        default_angles = {name: 0.0 for name in self.FINGERS_LIST}
+        default_lengths = {name: 0.0 for name in self.BONE_NAMES_LIST}
+        default_ratios = {name: 0.0 for name in self.BONE_NAMES_LIST}
+        
+        return {
+            'angles': default_angles, 
+            'bone_lengths': default_lengths,
+            'bone_ratios': default_ratios,
+            'is_outlier': False,
+            'is_calibrated': self.is_calibrated,
+            'hand_pos': None
+        }
