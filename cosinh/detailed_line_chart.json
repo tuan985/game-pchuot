@@ -1,0 +1,81 @@
+{
+  "config": {
+    "view": {
+      "continuousWidth": 300,
+      "continuousHeight": 300
+    }
+  },
+  "data": {
+    "name": "data-829d5b7a544b64b1263d59664f33b1e9"
+  },
+  "mark": "line",
+  "encoding": {
+    "color": {
+      "field": "finger",
+      "legend": null,
+      "title": "Ngón tay"
+    },
+    "tooltip": [
+      {
+        "field": "timestamp",
+        "title": "Thời gian"
+      },
+      {
+        "field": "finger",
+        "title": "Ngón tay"
+      },
+      {
+        "field": "angle",
+        "format": ".1f",
+        "title": "Góc (độ)"
+      }
+    ],
+    "x": {
+      "field": "timestamp",
+      "title": "Thời gian (timestamp)",
+      "type": "temporal"
+    },
+    "y": {
+      "field": "angle",
+      "title": "Góc gập (độ)",
+      "type": "quantitative"
+    },
+    "row": {
+      "field": "finger",
+      "title": "Ngón tay",
+      "header": {
+        "labelAngle": 0,
+        "labelAlign": "left"
+      }
+    }
+  },
+  "interactive": true,
+  "title": "Diễn biến góc gập (Chi tiết cho từng ngón)",
+  "transform": [
+    {
+      "fold": [
+        "thumb_angle",
+        "index_angle",
+        "middle_angle",
+        "ring_angle",
+        "pinky_angle"
+      ],
+      "as": [
+        "finger",
+        "angle"
+      ]
+    },
+    {
+      "calculate": "replace(datum.finger, '_angle', '')",
+      "as": "finger"
+    },
+    {
+      "filter": "datum.is_outlier == false"
+    }
+  ],
+  "$schema": "https://vega.github.io/schema/vega-lite/v5.19.0.json",
+  "datasets": {
+    "data-829d5b7a544b64b1263d59664f33b1e9": "game_angles_detailed_20251102_140450.xlsx - Sheet.csv"
+  }
+}
+
